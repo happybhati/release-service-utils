@@ -58,6 +58,7 @@ from .gitlab import (  # noqa: F401
     get_or_create_merge_request,
     get_project,
     is_merge_not_ready_error,
+    is_missing_source_branch_error,
     merge_request_has_conflict,
     merge_request_is_mergeable,
     merge_request_pipeline_failed,

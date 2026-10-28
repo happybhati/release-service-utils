@@ -51,6 +51,25 @@ def is_insufficient_scope_error(exc: BaseException) -> bool:
     return "insufficient_scope" in str(exc).lower()
 
 
+def is_missing_source_branch_error(exc: BaseException) -> bool:
+    """Return True when GitLab rejected MR create because the source branch is not visible.
+
+    GitLab.cee can lag behind ``git push`` (Gitaly / read-replica). The API then
+    returns HTTP 400 ``source_branch: does not exist`` even though the push
+    succeeded.
+    """
+    if not isinstance(exc, GitlabError):
+        return False
+    if getattr(exc, "response_code", None) != 400:
+        return False
+    parts = [str(exc)]
+    error_message = getattr(exc, "error_message", None)
+    if error_message is not None and error_message is not exc:
+        parts.append(str(error_message))
+    text = " ".join(parts).lower()
+    return "source_branch" in text and "does not exist" in text
+
+
 def _validate_positive_finite(name: str, value: float) -> None:
     """Reject non-finite or non-positive timing values before polling."""
     if not math.isfinite(value) or value <= 0:

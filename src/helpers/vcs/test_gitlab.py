@@ -1886,6 +1886,34 @@ def test_is_insufficient_scope_error_rejects_unrelated() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    ("exc", "expected"),
+    [
+        (
+            GitlabError({"source_branch": ["does not exist"]}, response_code=400),
+            True,
+        ),
+        (
+            GitlabError("source_branch: ['does not exist']", response_code=400),
+            True,
+        ),
+        (GitlabError("title is blank", response_code=400), False),
+        (
+            GitlabError({"target_branch": ["does not exist"]}, response_code=400),
+            False,
+        ),
+        (
+            GitlabError({"source_branch": ["does not exist"]}, response_code=404),
+            False,
+        ),
+        (ValueError("source_branch does not exist"), False),
+    ],
+)
+def test_is_missing_source_branch_error(exc: BaseException, expected: bool) -> None:
+    """Detect only GitLab 400 source_branch visibility lag, not other 400s."""
+    assert gitlab.is_missing_source_branch_error(exc) is expected
+
+
 def test_poll_remaining_seconds_elapsed_without_callback(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

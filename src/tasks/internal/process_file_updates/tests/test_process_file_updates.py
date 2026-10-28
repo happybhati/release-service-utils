@@ -544,6 +544,83 @@ def test_gitlab_create_mr_raises_on_gitlab_error() -> None:
     assert "creating GitLab merge request" in str(exc.value)
 
 
+_SLEEP = "release_service_utils.helpers.retry.retry.time.sleep"
+_MISSING_SOURCE_BRANCH = GitlabError(
+    {"source_branch": ["does not exist"]},
+    response_code=400,
+)
+
+
+def _gitlab_create_mr_kwargs(client: mock.Mock) -> dict[str, object]:
+    """Keyword arguments for ``gitlab_create_mr`` tests."""
+    return {
+        "head": "b",
+        "title": "t",
+        "target_branch": "main",
+        "description": "d",
+        "upstream_repo": "https://gitlab.com/org/up.git",
+        "gitlab_client": client,
+    }
+
+
+@mock.patch(_SLEEP)
+def test_gitlab_create_mr_retries_missing_source_branch(
+    mock_sleep: mock.Mock,
+) -> None:
+    """Retry MR create when GitLab has not indexed the pushed branch yet."""
+    client = _mock_gitlab_client()
+    created = client.projects.get.return_value.mergerequests.create.return_value
+    client.projects.get.return_value.mergerequests.create.side_effect = [
+        _MISSING_SOURCE_BRANCH,
+        created,
+    ]
+
+    result = process_file_updates.process_file_updates.gitlab_create_mr(
+        **_gitlab_create_mr_kwargs(client),
+    )
+
+    assert json.loads(result) == {"merge_request": created.web_url}
+    mock_sleep.assert_called_once_with(5)
+    assert client.projects.get.return_value.mergerequests.create.call_count == 2
+
+
+@mock.patch(_SLEEP)
+def test_gitlab_create_mr_does_not_retry_unrelated_400(mock_sleep: mock.Mock) -> None:
+    """Other GitLab 400 responses fail immediately."""
+    client = _mock_gitlab_client(
+        create_error=GitlabError("title is blank", response_code=400),
+    )
+    with pytest.raises(tekton.CheckStepError) as exc:
+        process_file_updates.process_file_updates.gitlab_create_mr(
+            **_gitlab_create_mr_kwargs(client),
+        )
+    assert "creating GitLab merge request" in str(exc.value)
+    mock_sleep.assert_not_called()
+    assert client.projects.get.return_value.mergerequests.create.call_count == 1
+
+
+@mock.patch(_SLEEP)
+def test_gitlab_create_mr_exhausts_missing_source_branch_retries(
+    mock_sleep: mock.Mock,
+) -> None:
+    """Give up with ``CheckStepError`` after the source-branch retries."""
+    client = _mock_gitlab_client(create_error=_MISSING_SOURCE_BRANCH)
+    with pytest.raises(tekton.CheckStepError) as exc:
+        process_file_updates.process_file_updates.gitlab_create_mr(
+            **_gitlab_create_mr_kwargs(client),
+        )
+    assert "creating GitLab merge request" in str(exc.value)
+    assert mock_sleep.call_count == 5
+    assert mock_sleep.call_args_list == [
+        mock.call(5),
+        mock.call(10),
+        mock.call(20),
+        mock.call(20),
+        mock.call(20),
+    ]
+    assert client.projects.get.return_value.mergerequests.create.call_count == 6
+
+
 def test_iter_konflux_open_mrs_raises_on_project_lookup_error() -> None:
     """Project lookup failures raise ``CheckStepError``."""
     with pytest.raises(tekton.CheckStepError) as exc:

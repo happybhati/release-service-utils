@@ -42,6 +42,7 @@ from gitlab.exceptions import GitlabError
 
 from release_service_utils.helpers import file
 from release_service_utils.helpers import redact
+from release_service_utils.helpers import retry
 from release_service_utils.helpers import tekton
 from release_service_utils.helpers.logger import logger
 from release_service_utils.helpers.vcs import git as vcs_git
@@ -50,6 +51,13 @@ from release_service_utils.helpers.vcs import gitlab as vcs_gitlab
 PROG = "process_file_updates.py"
 FILE_UPDATES_SECRET_MOUNT_ENV = "FILE_UPDATES_SECRET_MOUNT"
 _REPLACEMENT_EXPRESSION = re.compile(r"^\|([^|\n]*)\|([^|\n]*)\|$")
+_SOURCE_BRANCH_RETRY_ATTEMPTS = 6
+_SOURCE_BRANCH_RETRY_BASE_SLEEP_SECONDS = 5
+_SOURCE_BRANCH_RETRY_MAX_SLEEP_SECONDS = 20
+
+
+class _SourceBranchNotIndexedError(Exception):
+    """GitLab API has not indexed a just-pushed source branch yet."""
 
 
 @dataclass(frozen=True)
@@ -189,17 +197,40 @@ def gitlab_create_mr(
     upstream_repo: str,
     gitlab_client: Gitlab,
 ) -> str:
-    """Create a merge request; return JSON ``{"merge_request": url}`` for Tekton results."""
+    """Create a merge request; return JSON ``{"merge_request": url}`` for Tekton results.
+
+    Retries GitLab HTTP 400 ``source_branch does not exist`` after a successful
+    push, which happens when Gitaly has not yet indexed the new branch.
+    """
+
+    def _create() -> Any:
+        try:
+            return vcs_gitlab.create_merge_request(
+                gitlab_client,
+                upstream_repo,
+                source_branch=head,
+                target_branch=target_branch,
+                title=title,
+                description=description,
+            )
+        except GitlabError as e:
+            if vcs_gitlab.is_missing_source_branch_error(e):
+                logger.info(
+                    "GitLab has not indexed source branch %s yet; retrying MR create",
+                    head,
+                )
+                raise _SourceBranchNotIndexedError(str(e)) from e
+            raise
+
     try:
-        merge_request = vcs_gitlab.create_merge_request(
-            gitlab_client,
-            upstream_repo,
-            source_branch=head,
-            target_branch=target_branch,
-            title=title,
-            description=description,
+        merge_request = retry.retry_with_exponential_backoff(
+            _create,
+            max_attempts=_SOURCE_BRANCH_RETRY_ATTEMPTS,
+            retry_on=_SourceBranchNotIndexedError,
+            base_sleep_seconds=_SOURCE_BRANCH_RETRY_BASE_SLEEP_SECONDS,
+            max_sleep_seconds=_SOURCE_BRANCH_RETRY_MAX_SLEEP_SECONDS,
         )
-    except (GitlabError, ValueError) as e:
+    except (_SourceBranchNotIndexedError, GitlabError, ValueError) as e:
         raise tekton.CheckStepError("creating GitLab merge request", e) from e
     return json.dumps({"merge_request": merge_request.web_url})
 
@@ -665,7 +696,7 @@ def commit_and_create_mr(
     vcs_git.commit_staged(repo_cwd, "fileUpdates changes")
     vcs_git.push(repo_cwd, working_branch)
 
-    logger.info("Creating Pull Request...")
+    logger.info("Creating merge request from branch %s", working_branch)
     mr_msg = f"[Konflux release] {component_group}: fileUpdates changes {working_branch}"
     mr_json = gitlab_create_mr(
         head=working_branch,
